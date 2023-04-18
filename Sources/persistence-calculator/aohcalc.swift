@@ -28,6 +28,24 @@ enum AoHCalcError: Error {
     case TooMuchData
 }
 
+// from https://github.com/kodecocodes/swift-algorithm-club/blob/master/Binary%20Search/BinarySearch.swift
+public func binarySearch<T: Comparable>(_ a: [T], key: T) -> Int? {
+    var lowerBound = 0
+    var upperBound = a.count
+    while lowerBound < upperBound {
+        let midIndex = lowerBound + (upperBound - lowerBound) / 2
+        let val = a[midIndex]
+        if val == key {
+            return midIndex
+        } else if val < key {
+            lowerBound = midIndex + 1
+        } else {
+            upperBound = midIndex
+        }
+    }
+    return nil
+}
+
 @main
 struct aohcalc: ParsableCommand {
     @Argument(help: "The IUCN species ID")
@@ -108,10 +126,8 @@ struct aohcalc: ParsableCommand {
         var area = 0.0
 
         let chunkSize = 512//targetted_geometry.window.ysize/100
-        let bufferSize = chunkSize * targetted_geometry.window.xsize
-        let resultBuffer = UnsafeMutablePointer<Double>.allocate(capacity: bufferSize)
 
-        let habitat_list: [UInt8] = [130, 100, 40, 200, 201, 202, 140, 110, 152, 220, 150, 120, 153, 122, 60, 61, 62]
+        let habitat_list: [UInt8] = [130, 100, 40, 200, 201, 202, 140, 110, 152, 220, 150, 120, 153, 122, 60, 61, 62].sorted()
 
         for y in stride(from: 0, to: targetted_geometry.window.ysize, by: chunkSize) {
             let actualSize = y + chunkSize < targetted_geometry.window.ysize ? chunkSize : targetted_geometry.window.ysize - y
@@ -122,22 +138,13 @@ struct aohcalc: ParsableCommand {
                 ysize: actualSize
             )
             try targetted_geometry.withDataAt(region: window) { geometry_data in
-                guard geometry_data.count <= bufferSize else {
-                    throw AoHCalcError.TooMuchData
-                }
 
                 try targetted_elevation.withDataAt(region: window) { elevation_data in
-                    guard elevation_data.count <= bufferSize else {
-                        throw AoHCalcError.TooMuchData
-                    }
                     guard elevation_data.count == geometry_data.count else {
                         throw AoHCalcError.TooMuchData
                     }
 
                     try targetted_habitat.withDataAt(region: window) { habitat_data in
-                        guard habitat_data.count <= bufferSize else {
-                            throw AoHCalcError.TooMuchData
-                        }
                         guard habitat_data.count == geometry_data.count else {
                             throw AoHCalcError.TooMuchData
                         }
@@ -147,26 +154,29 @@ struct aohcalc: ParsableCommand {
                                 throw AoHCalcError.TooMuchData
                             }
 
-                            for i in 0..<elevation_data.count {
-                                let elevation: Int16 = elevation_data[i]
-                                let habitat: UInt8 = habitat_data[i]
+                            let resultBuffer: [Double] = geometry_data.enumerated().map { index, geometry in
                                 var val: Double = 0
-                                if (elevation >= 0) && (elevation <= 3800) {
-                                    if (habitat_list.contains(habitat)) {
-                                        if (geometry_data[i] != 0) {
-                                            val = area_data[(i / targetted_geometry.window.xsize)]
+                                if geometry != 0 {
+                                    let elevation: Int16 = elevation_data[index]
+                                    if (elevation >= 0) && (elevation <= 3800) {
+                                        let habitat: UInt8 = habitat_data[index]
+                                        if binarySearch(habitat_list, key: habitat) != nil {
+                                        // if habitat_list.firstIndex(of: habitat) != nil {
+                                            val = area_data[(index / targetted_geometry.window.xsize)]
                                             area += val
                                         }
                                     }
                                 }
-                                resultBuffer[i] = val
+                                return val
                             }
 
                             let area = LibTIFF.Area(
                                 origin: Point(x: 0, y: y),
                                 size: Size(width: targetted_geometry.window.xsize, height: actualSize)
                             )
-			                try geotiff.write(area: area, buffer: resultBuffer)
+                            try resultBuffer.withUnsafeBufferPointer {
+    			                try geotiff.write(area: area, buffer: $0)
+                            }
                         }
                     }
                 }

@@ -67,14 +67,15 @@ struct aohcalc: ParsableCommand {
         geometry: GeometryLayer,
         area: UniformAreaLayer<Double>,
         elevation: GeoTIFFReadLayer<Int16>,
-        habitat: GeoTIFFReadLayer<UInt8>
+        habitat: GeoTIFFReadLayer<UInt8>,
+        habitat_types: Set<Int16>
     ) throws -> Double {
         let layers: [any Yirgacheffe.Layer] = [geometry, area, elevation, habitat]
         let intersection = try calculateIntersection(layers: layers)
         let targetted_geometry = try geometry.setAreaOfInterest(area: intersection) as! GeometryLayer
         let targetted_area = try area.setAreaOfInterest(area: intersection) as! UniformAreaLayer<Double>
         let targetted_elevation = try elevation.setAreaOfInterest(area: intersection) as! GeoTIFFReadLayer<Int16>
-        let targetted_habitat = try habitat.setAreaOfInterest(area: intersection) as! GeoTIFFReadLayer<UInt8>
+        let targetted_habitat = try habitat.setAreaOfInterest(area: intersection) as! GeoTIFFReadLayer<Int16>
 
         let path = "/Users/michael/Desktop/test.tiff"
         let url = URL(fileURLWithPath: path)
@@ -127,7 +128,7 @@ struct aohcalc: ParsableCommand {
 
         let chunkSize = 512//targetted_geometry.window.ysize/100
 
-        let habitat_list: [UInt8] = [130, 100, 40, 200, 201, 202, 140, 110, 152, 220, 150, 120, 153, 122, 60, 61, 62].sorted()
+        let habitat_list = Array(habitat_types).sorted()
 
         for y in stride(from: 0, to: targetted_geometry.window.ysize, by: chunkSize) {
             let actualSize = y + chunkSize < targetted_geometry.window.ysize ? chunkSize : targetted_geometry.window.ysize - y
@@ -159,7 +160,7 @@ struct aohcalc: ParsableCommand {
                                 if geometry != 0 {
                                     let elevation: Int16 = elevation_data[index]
                                     if (elevation >= 0) && (elevation <= 3800) {
-                                        let habitat: UInt8 = habitat_data[index]
+                                        let habitat: Int16 = habitat_data[index]
                                         if binarySearch(habitat_list, key: habitat) != nil {
                                         // if habitat_list.firstIndex(of: habitat) != nil {
                                             val = area_data[(index / targetted_geometry.window.xsize)]
@@ -209,6 +210,10 @@ struct aohcalc: ParsableCommand {
             return
         }
 
+        let iucnBatch = try IUCNBatch(experimentConfig.iucnBatch)
+        let iucnHabitats = try iucnBatch.getHabitatForSpecies(taxid)
+        let jungHabitats = try convertIUCNToJung(iucnHabitats)
+
         let package = try GeoPackage(experimentConfig.range)
         let layer = try package.getLayers().first!
 
@@ -221,7 +226,7 @@ struct aohcalc: ParsableCommand {
         let elevationLayer = try GeoTIFFReadLayer<Int16>(experimentConfig.elevation)
         let habitatLayer = try GeoTIFFReadLayer<UInt8>(experimentConfig.habitat)
 
-        let aoh = try calculator(geometry: rangeLayer, area: areaLayer, elevation: elevationLayer, habitat: habitatLayer)
+        let aoh = try calculator(geometry: rangeLayer, area: areaLayer, elevation: elevationLayer, habitat: habitatLayer, habitat_types: jungHabitats)
         print("\(aoh)")
     }
 }

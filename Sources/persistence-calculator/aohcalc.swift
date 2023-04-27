@@ -6,6 +6,20 @@ import LibTIFF
 import SQLite
 import Yirgacheffe
 
+#if true //experiment == "jung"
+typealias AreaType = Float
+typealias ElevationType = UInt16
+typealias HabitatType = Int16
+#else // esacii
+typealias AreaType = Double
+typealias ElevationType = Int16
+typealias HabitatType = UInt8
+#endif
+
+typealias AreaLayer = UniformAreaLayer<AreaType>
+typealias ElevationLayer = GeoTIFFReadLayer<ElevationType>
+typealias HabitatLayer = GeoTIFFReadLayer<HabitatType>
+
 enum Seasonality: String, EnumerableFlag, ExpressibleByArgument {
     case breeding, nonbreeding, resident
 }
@@ -65,19 +79,28 @@ struct aohcalc: ParsableCommand {
 
     func calculator(
         geometry: GeometryLayer,
-        area: UniformAreaLayer<Double>,
-        elevation: GeoTIFFReadLayer<Int16>,
-        habitat: GeoTIFFReadLayer<UInt8>,
-        habitat_types: Set<Int16>
+        area: AreaLayer,
+        elevation: ElevationLayer,
+        habitat: HabitatLayer,
+        habitat_types: Set<HabitatType>,
+        elevation_range: ClosedRange<Int>
     ) throws -> Double {
         let layers: [any Yirgacheffe.Layer] = [geometry, area, elevation, habitat]
-        let intersection = try calculateIntersection(layers: layers)
+        let intersection: Yirgacheffe.Area
+        do {
+            intersection = try calculateIntersection(layers: layers)
+        } catch {
+            for layer in layers {
+                print("\(layer.pixelScale)")
+            }
+            throw error
+        }
         let targetted_geometry = try geometry.setAreaOfInterest(area: intersection) as! GeometryLayer
-        let targetted_area = try area.setAreaOfInterest(area: intersection) as! UniformAreaLayer<Double>
-        let targetted_elevation = try elevation.setAreaOfInterest(area: intersection) as! GeoTIFFReadLayer<Int16>
-        let targetted_habitat = try habitat.setAreaOfInterest(area: intersection) as! GeoTIFFReadLayer<Int16>
+        let targetted_area = try area.setAreaOfInterest(area: intersection) as! AreaLayer
+        let targetted_elevation = try elevation.setAreaOfInterest(area: intersection) as! ElevationLayer
+        let targetted_habitat = try habitat.setAreaOfInterest(area: intersection) as! HabitatLayer
 
-        let path = "/Users/michael/Desktop/test.tiff"
+        let path = "/scratch/4C/test.tiff"
         let url = URL(fileURLWithPath: path)
         let parentUrl = url.deletingLastPathComponent()
 
@@ -126,62 +149,110 @@ struct aohcalc: ParsableCommand {
 
         var area = 0.0
 
-        let chunkSize = 512//targetted_geometry.window.ysize/100
+        // On Linux rendering is backed by Cairo for the vector layers,
+        // and the maximum size of an image there is 32K by 32K
+        // let chunkSize = Size(width: 512, height: 512)
+        let chunkSize = Size(width: targetted_geometry.window.xsize, height: 512)
 
         let habitat_list = Array(habitat_types).sorted()
 
-        for y in stride(from: 0, to: targetted_geometry.window.ysize, by: chunkSize) {
-            let actualSize = y + chunkSize < targetted_geometry.window.ysize ? chunkSize : targetted_geometry.window.ysize - y
-            let window = Window(
-                xoff: 0,
-                yoff: y,
-                xsize: targetted_geometry.window.xsize,
-                ysize: actualSize
-            )
-            try targetted_geometry.withDataAt(region: window) { geometry_data in
+        let target_window = targetted_geometry.window
 
-                try targetted_elevation.withDataAt(region: window) { elevation_data in
-                    guard elevation_data.count == geometry_data.count else {
+        for y in stride(from: 0, to: targetted_geometry.window.ysize, by: chunkSize.height) {
+            let actualHeight = y + chunkSize.height < target_window.ysize ? chunkSize.height : target_window.ysize - y
+
+            // hack to work around TIFF file format - we should use tiles eventually
+            let buffer = UnsafeMutableBufferPointer<Double>.allocate(capacity: actualHeight * target_window.xsize)
+            defer { buffer.deallocate() }
+
+            for x in stride(from: 0, to: targetted_geometry.window.xsize, by: chunkSize.width) {
+
+                let actualWidth = x + chunkSize.width < target_window.xsize ? chunkSize.width : target_window.xsize - x
+
+                let window = Window(
+                    xoff: x,
+                    yoff: y,
+                    xsize: actualWidth,
+                    ysize: actualHeight
+                )
+                try targetted_geometry.withDataAt(region: window) { geometry_data, geometry_stride in
+                    guard geometry_data.count >= (actualWidth * actualHeight) else {
+                        throw AoHCalcError.TooMuchData
+                    }
+                    guard geometry_stride >= actualWidth else {
                         throw AoHCalcError.TooMuchData
                     }
 
-                    try targetted_habitat.withDataAt(region: window) { habitat_data in
-                        guard habitat_data.count == geometry_data.count else {
+                    try targetted_elevation.withDataAt(region: window) { elevation_data, elevation_stride in
+                        guard elevation_data.count == (actualWidth * actualHeight) else {
+                            throw AoHCalcError.TooMuchData
+                        }
+                        guard elevation_stride == actualWidth else {
                             throw AoHCalcError.TooMuchData
                         }
 
-                        try targetted_area.withDataAt(region: window) { area_data in
-                            guard area_data.count == actualSize else {
+                        try targetted_habitat.withDataAt(region: window) { habitat_data, habitat_stride in
+                            guard habitat_data.count == (actualWidth * actualHeight) else {
+                                throw AoHCalcError.TooMuchData
+                            }
+                            guard habitat_stride == actualWidth else {
                                 throw AoHCalcError.TooMuchData
                             }
 
-                            let resultBuffer: [Double] = geometry_data.enumerated().map { index, geometry in
-                                var val: Double = 0
-                                if geometry != 0 {
-                                    let elevation: Int16 = elevation_data[index]
-                                    if (elevation >= 0) && (elevation <= 3800) {
-                                        let habitat: Int16 = habitat_data[index]
-                                        if binarySearch(habitat_list, key: habitat) != nil {
-                                        // if habitat_list.firstIndex(of: habitat) != nil {
-                                            val = area_data[(index / targetted_geometry.window.xsize)]
-                                            area += val
+                            try targetted_area.withDataAt(region: window) { area_data, area_stride in
+                                guard area_data.count == actualHeight else {
+                                    throw AoHCalcError.TooMuchData
+                                }
+                                guard area_stride == 1 else {
+                                    throw AoHCalcError.TooMuchData
+                                }
+
+                                let resultBuffer: [Double] = geometry_data.enumerated().map { index, geometry in
+                                    let indexWithoutStride = ((index / geometry_stride) * actualWidth) + (index % geometry_stride)
+
+                                    var val: Double = 0.0
+                                    if geometry != 0 {
+                                        let elevation = Int(elevation_data[indexWithoutStride])
+                                        if elevation_range.contains(elevation) {
+                                            let habitat: HabitatType = habitat_data[indexWithoutStride]
+                                            if binarySearch(habitat_list, key: habitat) != nil {
+                                                val = Double(area_data[(index / geometry_stride)])
+                                                area += val
+                                            }
                                         }
                                     }
+                                    return val
                                 }
-                                return val
-                            }
 
-                            let area = LibTIFF.Area(
-                                origin: Point(x: 0, y: y),
-                                size: Size(width: targetted_geometry.window.xsize, height: actualSize)
-                            )
-                            try resultBuffer.withUnsafeBufferPointer {
-    			                try geotiff.write(area: area, buffer: $0)
+                                resultBuffer.withUnsafeBufferPointer { result in
+                                    for row in 0..<actualHeight {
+                                        let src = result.baseAddress!.advanced(by: row * geometry_stride)
+                                        let target = buffer.baseAddress!.advanced(by: (row * target_window.xsize) + x)
+                                        target.update(from: src, count: actualWidth)
+                                    }
+                                }
+//
+//                                 let area = LibTIFF.Area(
+//                                     origin: Point(x: x, y: y),
+//                                     size: Size(width: actualWidth, height: actualHeight)
+//                                 )
+//                                 try resultBuffer.withUnsafeBufferPointer {
+//     			                    try geotiff.write(area: area, buffer: $0)
+//                                 }
                             }
                         }
                     }
                 }
             }
+
+            let area = LibTIFF.Area(
+                origin: Point(x: 0, y: y),
+                size: Size(width: target_window.xsize, height: actualHeight)
+            )
+            let immute = UnsafeBufferPointer<Double>(buffer)
+            try geotiff.write(area: area, buffer: immute)
+
+
         }
 
         geotiff.close()
@@ -212,7 +283,10 @@ struct aohcalc: ParsableCommand {
 
         let iucnBatch = try IUCNBatch(experimentConfig.iucnBatch)
         let iucnHabitats = try iucnBatch.getHabitatForSpecies(taxid)
-        let jungHabitats = try convertIUCNToJung(iucnHabitats)
+        let jungHabitats = try Set(convertIUCNToJung(iucnHabitats).map { HabitatType($0 & 0xFF) })
+        let jungElevation = try iucnBatch.getElevationRangeForSpecies(taxid)
+        print("Habitats: \(Array(jungHabitats).sorted())")
+        print("Elevation: \(jungElevation)")
 
         let package = try GeoPackage(experimentConfig.range)
         let layer = try package.getLayers().first!
@@ -221,12 +295,46 @@ struct aohcalc: ParsableCommand {
         let features = try package.getFeaturesForLayer(layer: layer, predicate: id_column == Double(taxid))
         let species = try package.getGeometryForFeature(feature: features.first!)
 
-        let areaLayer = try UniformAreaLayer<Double>(experimentConfig.area)
-        let rangeLayer = try GeometryLayer(geometry: species, pixelScale: areaLayer.pixelScale)
-        let elevationLayer = try GeoTIFFReadLayer<Int16>(experimentConfig.elevation)
-        let habitatLayer = try GeoTIFFReadLayer<UInt8>(experimentConfig.habitat)
+        let areaLayer: AreaLayer
+        do {
+            areaLayer = try AreaLayer(experimentConfig.area)
+        } catch {
+            print("Failed to open area \(experimentConfig.area): \(error)")
+            return
+        }
 
-        let aoh = try calculator(geometry: rangeLayer, area: areaLayer, elevation: elevationLayer, habitat: habitatLayer, habitat_types: jungHabitats)
+        let rangeLayer: GeometryLayer
+        do {
+            rangeLayer = try GeometryLayer(geometry: species, pixelScale: areaLayer.pixelScale)
+        } catch {
+            print("Failed to open geometry for species \(taxid): \(error)")
+            return
+        }
+
+        let elevationLayer: ElevationLayer
+        do {
+            elevationLayer = try ElevationLayer(experimentConfig.elevation)
+        } catch {
+            print("Failed to open elevation \(experimentConfig.elevation): \(error)")
+            return
+        }
+
+        let habitatLayer: HabitatLayer
+        do {
+            habitatLayer = try HabitatLayer(experimentConfig.habitat)
+        } catch {
+            print("Failed to open habitat \(experimentConfig.habitat): \(error)")
+            return
+        }
+
+        let aoh = try calculator(
+            geometry: rangeLayer,
+            area: areaLayer,
+            elevation: elevationLayer,
+            habitat: habitatLayer,
+            habitat_types: jungHabitats,
+            elevation_range: jungElevation
+        )
         print("\(aoh)")
     }
 }

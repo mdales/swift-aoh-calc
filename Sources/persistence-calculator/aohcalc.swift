@@ -152,7 +152,7 @@ struct aohcalc: ParsableCommand {
         // On Linux rendering is backed by Cairo for the vector layers,
         // and the maximum size of an image there is 32K by 32K
         // let chunkSize = Size(width: 512, height: 512)
-        let chunkSize = Size(width: targetted_geometry.window.xsize, height: 512)
+        let chunkSize = Size(width: 512, height: 512)
 
         let habitat_list = Array(habitat_types).sorted()
 

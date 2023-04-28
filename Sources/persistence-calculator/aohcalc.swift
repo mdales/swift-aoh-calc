@@ -38,6 +38,7 @@ struct Config: Codable {
 }
 
 enum AoHCalcError: Error {
+    case CouldNotMakePath
     case ExperimentNotFound(String)
     case TooMuchData
 }
@@ -71,6 +72,9 @@ struct aohcalc: ParsableCommand {
     @Argument(help: "Name of experiment group from configuration json")
     var experiment: String
 
+    @Argument(help: "Directory of output file")
+    var resultsDirectory: String
+
     @Option(help: "Path of configuration json")
     var configPath = "config.json"
 
@@ -83,89 +87,27 @@ struct aohcalc: ParsableCommand {
         elevation: ElevationLayer,
         habitat: HabitatLayer,
         habitat_types: Set<HabitatType>,
-        elevation_range: ClosedRange<Int>
+        elevation_range: ClosedRange<Int>,
+        output: GeoTIFFImage<Double>
     ) throws -> Double {
-        let layers: [any Yirgacheffe.Layer] = [geometry, area, elevation, habitat]
-        let intersection: Yirgacheffe.Area
-        do {
-            intersection = try calculateIntersection(layers: layers)
-        } catch {
-            for layer in layers {
-                print("\(layer.pixelScale)")
-            }
-            throw error
-        }
-        let targetted_geometry = try geometry.setAreaOfInterest(area: intersection) as! GeometryLayer
-        let targetted_area = try area.setAreaOfInterest(area: intersection) as! AreaLayer
-        let targetted_elevation = try elevation.setAreaOfInterest(area: intersection) as! ElevationLayer
-        let targetted_habitat = try habitat.setAreaOfInterest(area: intersection) as! HabitatLayer
-
-        let path = "/scratch/4C/test.tiff"
-        let url = URL(fileURLWithPath: path)
-        let parentUrl = url.deletingLastPathComponent()
-
-        // Generate image and write PNG to file
-        try FileManager.default.createDirectory(at: parentUrl, withIntermediateDirectories: true)
-
-        let geotiff = try GeoTIFFImage<Double>(writingAt: path, size: Size(width: targetted_geometry.window.xsize, height: targetted_geometry.window.ysize), samplesPerPixel: 1, hasAlpha: false)
-
-        try geotiff.setPixelScale([geometry.pixelScale.x, geometry.pixelScale.y * -1, 0.0])
-        try geotiff.setTiePoint([0.0, 0.0, 0.0, targetted_geometry.area.left, targetted_geometry.area.top, 0.0])
-        try geotiff.setProjection("WGS 84")
-
-        let directoryEntries = [
-            GeoTIFFDirectoryEntry(
-                keyID: .GTModelTypeGeoKey,
-                tiffTag: nil,
-                valueCount: 1,
-                valueOrIndex: 2
-            ),
-            GeoTIFFDirectoryEntry(
-                keyID: .GTRasterTypeGeoKey,
-                tiffTag: nil,
-                valueCount: 1,
-                valueOrIndex: 1
-            ),
-            GeoTIFFDirectoryEntry(
-                keyID: .GeodeticCitationGeoKey,
-                tiffTag: 34737,
-                valueCount: 1,
-                valueOrIndex: 2 //?
-            ),
-            GeoTIFFDirectoryEntry(
-                keyID: .GeodeticCRSGeoKey,
-                tiffTag: nil,
-                valueCount: 1,
-                valueOrIndex: 4326
-            ),
-        ]
-        let directory = GeoTIFFDirectory(
-            majorVersion: 1,
-            minorVersion: 1,
-            revision: 1,
-            entries: directoryEntries
-        )
-        try geotiff.setDirectory(directory)
-
-        var area = 0.0
+        var total_area = 0.0
 
         // On Linux rendering is backed by Cairo for the vector layers,
         // and the maximum size of an image there is 32K by 32K
-        // let chunkSize = Size(width: 512, height: 512)
-        let chunkSize = Size(width: 512, height: 512)
+        let chunkSize = Size(width: (1 << 15) - 1, height: 1 << 10)
 
         let habitat_list = Array(habitat_types).sorted()
 
-        let target_window = targetted_geometry.window
+        let target_window = geometry.window
 
-        for y in stride(from: 0, to: targetted_geometry.window.ysize, by: chunkSize.height) {
+        // hack to work around TIFF file format - we should use tiles eventually
+        let buffer = UnsafeMutableBufferPointer<Double>.allocate(capacity: chunkSize.height * target_window.xsize)
+        defer { buffer.deallocate() }
+
+        for y in stride(from: 0, to: geometry.window.ysize, by: chunkSize.height) {
             let actualHeight = y + chunkSize.height < target_window.ysize ? chunkSize.height : target_window.ysize - y
 
-            // hack to work around TIFF file format - we should use tiles eventually
-            let buffer = UnsafeMutableBufferPointer<Double>.allocate(capacity: actualHeight * target_window.xsize)
-            defer { buffer.deallocate() }
-
-            for x in stride(from: 0, to: targetted_geometry.window.xsize, by: chunkSize.width) {
+            for x in stride(from: 0, to: geometry.window.xsize, by: chunkSize.width) {
 
                 let actualWidth = x + chunkSize.width < target_window.xsize ? chunkSize.width : target_window.xsize - x
 
@@ -175,7 +117,7 @@ struct aohcalc: ParsableCommand {
                     xsize: actualWidth,
                     ysize: actualHeight
                 )
-                try targetted_geometry.withDataAt(region: window) { geometry_data, geometry_stride in
+                try geometry.withDataAt(region: window) { geometry_data, geometry_stride in
                     guard geometry_data.count >= (actualWidth * actualHeight) else {
                         throw AoHCalcError.TooMuchData
                     }
@@ -183,7 +125,7 @@ struct aohcalc: ParsableCommand {
                         throw AoHCalcError.TooMuchData
                     }
 
-                    try targetted_elevation.withDataAt(region: window) { elevation_data, elevation_stride in
+                    try elevation.withDataAt(region: window) { elevation_data, elevation_stride in
                         guard elevation_data.count == (actualWidth * actualHeight) else {
                             throw AoHCalcError.TooMuchData
                         }
@@ -191,7 +133,7 @@ struct aohcalc: ParsableCommand {
                             throw AoHCalcError.TooMuchData
                         }
 
-                        try targetted_habitat.withDataAt(region: window) { habitat_data, habitat_stride in
+                        try habitat.withDataAt(region: window) { habitat_data, habitat_stride in
                             guard habitat_data.count == (actualWidth * actualHeight) else {
                                 throw AoHCalcError.TooMuchData
                             }
@@ -199,7 +141,7 @@ struct aohcalc: ParsableCommand {
                                 throw AoHCalcError.TooMuchData
                             }
 
-                            try targetted_area.withDataAt(region: window) { area_data, area_stride in
+                            try area.withDataAt(region: window) { area_data, area_stride in
                                 guard area_data.count == actualHeight else {
                                     throw AoHCalcError.TooMuchData
                                 }
@@ -207,38 +149,26 @@ struct aohcalc: ParsableCommand {
                                     throw AoHCalcError.TooMuchData
                                 }
 
-                                let resultBuffer: [Double] = geometry_data.enumerated().map { index, geometry in
-                                    let indexWithoutStride = ((index / geometry_stride) * actualWidth) + (index % geometry_stride)
+                                for iy in 0..<actualHeight {
+                                    for ix in 0..<actualWidth {
+                                        var val = 0.0
+                                        let geometry_index = (iy * geometry_stride) + ix
+                                        if geometry_data[geometry_index] != 0 {
 
-                                    var val: Double = 0.0
-                                    if geometry != 0 {
-                                        let elevation = Int(elevation_data[indexWithoutStride])
-                                        if elevation_range.contains(elevation) {
-                                            let habitat: HabitatType = habitat_data[indexWithoutStride]
-                                            if binarySearch(habitat_list, key: habitat) != nil {
-                                                val = Double(area_data[(index / geometry_stride)])
-                                                area += val
+                                            let index = (iy * actualWidth) + ix
+                                            let elevation = Int(elevation_data[index])
+                                            if elevation_range.contains(elevation) {
+                                                let habitat: HabitatType = habitat_data[index]
+                                                if binarySearch(habitat_list, key: habitat) != nil {
+                                                    val = Double(area_data[iy])
+                                                    total_area += val
+                                                }
                                             }
                                         }
-                                    }
-                                    return val
-                                }
-
-                                resultBuffer.withUnsafeBufferPointer { result in
-                                    for row in 0..<actualHeight {
-                                        let src = result.baseAddress!.advanced(by: row * geometry_stride)
-                                        let target = buffer.baseAddress!.advanced(by: (row * target_window.xsize) + x)
-                                        target.update(from: src, count: actualWidth)
+                                        let buffer_index = (iy * target_window.xsize) + (ix + x)
+                                        buffer[buffer_index] = val
                                     }
                                 }
-//
-//                                 let area = LibTIFF.Area(
-//                                     origin: Point(x: x, y: y),
-//                                     size: Size(width: actualWidth, height: actualHeight)
-//                                 )
-//                                 try resultBuffer.withUnsafeBufferPointer {
-//     			                    try geotiff.write(area: area, buffer: $0)
-//                                 }
                             }
                         }
                     }
@@ -250,14 +180,10 @@ struct aohcalc: ParsableCommand {
                 size: Size(width: target_window.xsize, height: actualHeight)
             )
             let immute = UnsafeBufferPointer<Double>(buffer)
-            try geotiff.write(area: area, buffer: immute)
-
-
+            try output.write(area: area, buffer: immute)
         }
 
-        geotiff.close()
-
-        return area
+        return total_area
     }
 
     mutating func run() throws {
@@ -283,7 +209,8 @@ struct aohcalc: ParsableCommand {
 
         let iucnBatch = try IUCNBatch(experimentConfig.iucnBatch)
         let iucnHabitats = try iucnBatch.getHabitatForSpecies(taxid)
-        let jungHabitats = try Set(convertIUCNToJung(iucnHabitats).map { HabitatType($0 & 0xFF) })
+        print("IUCN Habitats: \(iucnHabitats)")
+        let jungHabitats = try convertIUCNToJung(iucnHabitats)
         let jungElevation = try iucnBatch.getElevationRangeForSpecies(taxid)
         print("Habitats: \(Array(jungHabitats).sorted())")
         print("Elevation: \(jungElevation)")
@@ -327,14 +254,85 @@ struct aohcalc: ParsableCommand {
             return
         }
 
-        let aoh = try calculator(
-            geometry: rangeLayer,
-            area: areaLayer,
-            elevation: elevationLayer,
-            habitat: habitatLayer,
-            habitat_types: jungHabitats,
-            elevation_range: jungElevation
+        let layers: [any Yirgacheffe.Layer] = [rangeLayer, areaLayer, elevationLayer, habitatLayer]
+        let intersection: Yirgacheffe.Area
+        do {
+            intersection = try calculateIntersection(layers: layers)
+        } catch {
+            for layer in layers {
+                print("\(layer.pixelScale)")
+            }
+            throw error
+        }
+        let targetted_geometry = try rangeLayer.setAreaOfInterest(area: intersection) as! GeometryLayer
+        let targetted_area = try areaLayer.setAreaOfInterest(area: intersection) as! AreaLayer
+        let targetted_elevation = try elevationLayer.setAreaOfInterest(area: intersection) as! ElevationLayer
+        let targetted_habitat = try habitatLayer.setAreaOfInterest(area: intersection) as! HabitatLayer
+
+        let filename = "\(taxid)-\(seasonality).tif"
+
+        let outputDir = URL(fileURLWithPath: resultsDirectory)
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        let path = outputDir.appendingPathComponent(filename)
+
+        let geotiff = try GeoTIFFImage<Double>(
+            writingAt: path.path,
+            size: Size(width: targetted_geometry.window.xsize, height: targetted_geometry.window.ysize),
+            samplesPerPixel: 1,
+            hasAlpha: false,
+            useBigTIFF: true
         )
+        defer { geotiff.close() }
+
+        try geotiff.setPixelScale([targetted_geometry.pixelScale.x, targetted_geometry.pixelScale.y * -1, 0.0])
+        try geotiff.setTiePoint([0.0, 0.0, 0.0, targetted_geometry.area.left, targetted_geometry.area.top, 0.0])
+        try geotiff.setProjection("WGS 84")
+
+        let directoryEntries = [
+            GeoTIFFDirectoryEntry(
+                keyID: .GTModelTypeGeoKey,
+                tiffTag: nil,
+                valueCount: 1,
+                valueOrIndex: 2
+            ),
+            GeoTIFFDirectoryEntry(
+                keyID: .GTRasterTypeGeoKey,
+                tiffTag: nil,
+                valueCount: 1,
+                valueOrIndex: 1
+            ),
+            GeoTIFFDirectoryEntry(
+                keyID: .GeodeticCitationGeoKey,
+                tiffTag: 34737,
+                valueCount: 1,
+                valueOrIndex: 2 //?
+            ),
+            GeoTIFFDirectoryEntry(
+                keyID: .GeodeticCRSGeoKey,
+                tiffTag: nil,
+                valueCount: 1,
+                valueOrIndex: 4326
+            ),
+        ]
+        let directory = GeoTIFFDirectory(
+            majorVersion: 1,
+            minorVersion: 1,
+            revision: 1,
+            entries: directoryEntries
+        )
+        try geotiff.setDirectory(directory)
+
+
+        let aoh = try calculator(
+            geometry: targetted_geometry,
+            area: targetted_area,
+            elevation: targetted_elevation,
+            habitat: targetted_habitat,
+            habitat_types: jungHabitats,
+            elevation_range: jungElevation,
+            output: geotiff
+        )
+
         print("\(aoh)")
     }
 }

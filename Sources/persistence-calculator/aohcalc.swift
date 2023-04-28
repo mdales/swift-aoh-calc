@@ -107,45 +107,51 @@ struct aohcalc: ParsableCommand {
         for y in stride(from: 0, to: geometry.window.ysize, by: chunkSize.height) {
             let actualHeight = y + chunkSize.height < target_window.ysize ? chunkSize.height : target_window.ysize - y
 
-            for x in stride(from: 0, to: geometry.window.xsize, by: chunkSize.width) {
+            let band = Window(
+                xoff: 0,
+                yoff: y,
+                xsize: target_window.xsize,
+                ysize: actualHeight
+            )
 
-                let actualWidth = x + chunkSize.width < target_window.xsize ? chunkSize.width : target_window.xsize - x
+            try elevation.withDataAt(region: band) { elevation_data, elevation_stride in
+                guard elevation_data.count == (target_window.xsize * actualHeight) else {
+                    throw AoHCalcError.TooMuchData
+                }
+                guard elevation_stride == target_window.xsize else {
+                    throw AoHCalcError.TooMuchData
+                }
 
-                let window = Window(
-                    xoff: x,
-                    yoff: y,
-                    xsize: actualWidth,
-                    ysize: actualHeight
-                )
-                try geometry.withDataAt(region: window) { geometry_data, geometry_stride in
-                    guard geometry_data.count >= (actualWidth * actualHeight) else {
+                try habitat.withDataAt(region: band) { habitat_data, habitat_stride in
+                    guard habitat_data.count == (target_window.xsize * actualHeight) else {
                         throw AoHCalcError.TooMuchData
                     }
-                    guard geometry_stride >= actualWidth else {
+                    guard habitat_stride == target_window.xsize else {
                         throw AoHCalcError.TooMuchData
                     }
 
-                    try elevation.withDataAt(region: window) { elevation_data, elevation_stride in
-                        guard elevation_data.count == (actualWidth * actualHeight) else {
+                    try area.withDataAt(region: band) { area_data, area_stride in
+                        guard area_data.count == actualHeight else {
                             throw AoHCalcError.TooMuchData
                         }
-                        guard elevation_stride == actualWidth else {
+                        guard area_stride == 1 else {
                             throw AoHCalcError.TooMuchData
                         }
 
-                        try habitat.withDataAt(region: window) { habitat_data, habitat_stride in
-                            guard habitat_data.count == (actualWidth * actualHeight) else {
-                                throw AoHCalcError.TooMuchData
-                            }
-                            guard habitat_stride == actualWidth else {
-                                throw AoHCalcError.TooMuchData
-                            }
+                        for x in stride(from: 0, to: geometry.window.xsize, by: chunkSize.width) {
+                            let actualWidth = x + chunkSize.width < target_window.xsize ? chunkSize.width : target_window.xsize - x
 
-                            try area.withDataAt(region: window) { area_data, area_stride in
-                                guard area_data.count == actualHeight else {
+                            let window = Window(
+                                xoff: x,
+                                yoff: y,
+                                xsize: actualWidth,
+                                ysize: actualHeight
+                            )
+                            try geometry.withDataAt(region: window) { geometry_data, geometry_stride in
+                                guard geometry_data.count >= (actualWidth * actualHeight) else {
                                     throw AoHCalcError.TooMuchData
                                 }
-                                guard area_stride == 1 else {
+                                guard geometry_stride >= actualWidth else {
                                     throw AoHCalcError.TooMuchData
                                 }
 
@@ -153,20 +159,20 @@ struct aohcalc: ParsableCommand {
                                     for ix in 0..<actualWidth {
                                         var val = 0.0
                                         let geometry_index = (iy * geometry_stride) + ix
+                                        let band_index = (iy * target_window.xsize) + (ix + x)
+
                                         if geometry_data[geometry_index] != 0 {
 
-                                            let index = (iy * actualWidth) + ix
-                                            let elevation = Int(elevation_data[index])
+                                            let elevation = Int(elevation_data[band_index])
                                             if elevation_range.contains(elevation) {
-                                                let habitat: HabitatType = habitat_data[index]
+                                                let habitat: HabitatType = habitat_data[band_index]
                                                 if binarySearch(habitat_list, key: habitat) != nil {
                                                     val = Double(area_data[iy])
                                                     total_area += val
                                                 }
                                             }
                                         }
-                                        let buffer_index = (iy * target_window.xsize) + (ix + x)
-                                        buffer[buffer_index] = val
+                                        buffer[band_index] = val
                                     }
                                 }
                             }

@@ -22,6 +22,14 @@ typealias HabitatLayer = GeoTIFFReadLayer<HabitatType>
 
 enum Seasonality: String, EnumerableFlag, ExpressibleByArgument {
     case breeding, nonbreeding, resident
+
+    var iucnFilter: [HabitatSeason] {
+        switch self {
+            case .resident: return [.Resident, .Unknown]
+            case .breeding: return [.Resident, .Breeding, .Unknown]
+            case .nonbreeding: return [.Resident, .NonBreeding, .Unknown]
+        }
+    }
 }
 
 struct ExperimentConfig: Codable {
@@ -214,9 +222,8 @@ struct aohcalc: ParsableCommand {
         }
 
         let iucnBatch = try IUCNBatch(experimentConfig.iucnBatch)
-        let iucnHabitats = try iucnBatch.getHabitatForSpecies(taxid)
-        print("IUCN Habitats: \(iucnHabitats)")
-        let jungHabitats = try convertIUCNToJung(iucnHabitats)
+        let iucnHabitats = try iucnBatch.getHabitatForSpecies(taxid, seasonalityFilter: seasonality.iucnFilter, suitabilityFilter: [.Suitable, .Unknown])
+        let jungHabitats = try convertIUCNToJung(Set(iucnHabitats.map { $0.code }))
         let jungElevation = try iucnBatch.getElevationRangeForSpecies(taxid)
         print("Habitats: \(Array(jungHabitats).sorted())")
         print("Elevation: \(jungElevation)")
@@ -236,14 +243,6 @@ struct aohcalc: ParsableCommand {
             return
         }
 
-        let rangeLayer: GeometryLayer
-        do {
-            rangeLayer = try GeometryLayer(geometry: species, pixelScale: areaLayer.pixelScale)
-        } catch {
-            print("Failed to open geometry for species \(taxid): \(error)")
-            return
-        }
-
         let elevationLayer: ElevationLayer
         do {
             elevationLayer = try ElevationLayer(experimentConfig.elevation)
@@ -259,6 +258,15 @@ struct aohcalc: ParsableCommand {
             print("Failed to open habitat \(experimentConfig.habitat): \(error)")
             return
         }
+
+        let rangeLayer: GeometryLayer
+        do {
+            rangeLayer = try GeometryLayer(geometry: species, pixelScale: habitatLayer.pixelScale)
+        } catch {
+            print("Failed to open geometry for species \(taxid): \(error)")
+            return
+        }
+
 
         let layers: [any Yirgacheffe.Layer] = [rangeLayer, areaLayer, elevationLayer, habitatLayer]
         let intersection: Yirgacheffe.Area
